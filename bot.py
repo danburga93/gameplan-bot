@@ -288,7 +288,7 @@ async def on_ready():
     print(f"Logged in as {client.user} | {len(INDEX)} gameplans indexed")
 
 
-@tree.command(name="gp", description="Get the full gameplan for a villain"))
+@tree.command(name="gp", description="Get the full gameplan for a villain")
 @app_commands.describe(villain="Start typing the villain's name")
 async def gameplan(interaction: discord.Interaction, villain: str):
     # Public reply (everyone in the channel sees it) so images can be attached
