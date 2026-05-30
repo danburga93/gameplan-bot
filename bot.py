@@ -245,22 +245,21 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
-async def download_image(url):
+async def download_image(session, url):
     """Fetch an image from Notion's (temporary) URL into memory. Returns (bytes, filename) or None."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.read()
-                if len(data) > 9_000_000:   # stay under Discord's upload limit
-                    return None
-                # derive a clean filename from the path, ignoring the query string
-                path = url.split("?")[0]
-                fname = path.rsplit("/", 1)[-1] or "image.png"
-                if "." not in fname:
-                    fname += ".png"
-                return data, fname
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.read()
+            if len(data) > 9_000_000:   # stay under Discord's upload limit
+                return None
+            # derive a clean filename from the path, ignoring the query string
+            path = url.split("?")[0]
+            fname = path.rsplit("/", 1)[-1] or "image.png"
+            if "." not in fname:
+                fname += ".png"
+            return data, fname
     except Exception:
         return None
 
@@ -317,28 +316,56 @@ async def gameplan(interaction: discord.Interaction, villain: str):
         await interaction.followup.send(f"Error fetching gameplan: {e}", ephemeral=True)
         return
 
-    for seg in segments:
+    # Pre-download every image at once (parallel) so the wait happens all together,
+    # not one-after-another. Results are keyed back to their segment by index.
+    image_results = {}
+    image_segs = [(i, s) for i, s in enumerate(segments) if s["type"] == "image"]
+    if image_segs:
+        async with aiohttp.ClientSession() as session:
+            downloads = [download_image(session, s["url"]) for _, s in image_segs]
+            fetched = await asyncio.gather(*downloads)
+        for (i, _), result in zip(image_segs, fetched):
+            image_results[i] = result
+
+    sent = []  # collect every message we post so we can delete them later
+    for idx, seg in enumerate(segments):
         if seg["type"] == "text":
             for chunk in chunk_text(seg["content"]):
                 if chunk.strip():
-                    await interaction.followup.send(chunk, delete_after=DELETE_AFTER_SECONDS)
+                    msg = await interaction.followup.send(chunk, wait=True)
+                    sent.append(msg)
         elif seg["type"] == "image":
-            result = await download_image(seg["url"])
+            result = image_results.get(idx)
             caption = seg.get("caption") or ""
             if result:
                 data, fname = result
                 file = discord.File(io.BytesIO(data), filename=fname)
-                await interaction.followup.send(
+                msg = await interaction.followup.send(
                     content=(f"\U0001f4ce {caption}" if caption else None),
                     file=file,
-                    delete_after=DELETE_AFTER_SECONDS,
+                    wait=True,
                 )
             else:
                 # download failed (expired/too big) — note it instead of a broken link
-                await interaction.followup.send(
+                msg = await interaction.followup.send(
                     f"\U0001f4ce [image couldn't load{f' — {caption}' if caption else ''}]",
-                    delete_after=DELETE_AFTER_SECONDS,
+                    wait=True,
                 )
+            sent.append(msg)
+
+    # Schedule all of this reply's messages to delete after DELETE_AFTER_SECONDS.
+    if sent:
+        asyncio.create_task(delete_messages_later(sent, DELETE_AFTER_SECONDS))
+
+
+async def delete_messages_later(messages, delay):
+    """Wait, then delete each message. Ignores ones already gone."""
+    await asyncio.sleep(delay)
+    for msg in messages:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
 
 @gameplan.autocomplete("villain")
