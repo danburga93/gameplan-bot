@@ -1,5 +1,8 @@
 import os
+import io
 import asyncio
+
+import aiohttp
 
 from dotenv import load_dotenv
 load_dotenv()  # reads a local .env file if present; ignored when deployed
@@ -13,6 +16,8 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 GUILD_ID = os.environ.get("GUILD_ID")  # optional: makes the command appear instantly
+
+DELETE_AFTER_SECONDS = 16 * 60 * 60   # gameplan replies auto-delete after 16 hours
 
 notion = Client(auth=NOTION_TOKEN)
 
@@ -62,58 +67,69 @@ def fetch_all_children(block_id):
     return blocks
 
 
-def block_to_lines(block, depth=0):
+def _push_text(segments, line):
+    """Append a text line, merging into the previous text segment if there is one."""
+    if segments and segments[-1]["type"] == "text":
+        segments[-1]["content"] += "\n" + line
+    else:
+        segments.append({"type": "text", "content": line})
+
+
+def block_to_segments(block, segments, depth=0):
+    """Walk a Notion block into ordered segments: text runs and image objects."""
     t = block.get("type")
     data = block.get(t, {})
     indent = "  " * depth
     text = rich_to_text(data.get("rich_text"))
-    lines = []
 
     if t == "paragraph":
-        lines.append(indent + text)
+        _push_text(segments, indent + text)
     elif t == "heading_1":
-        lines.append("")
-        lines.append("# " + text)
+        _push_text(segments, "")
+        _push_text(segments, "# " + text)
     elif t == "heading_2":
-        lines.append("## " + text)
+        _push_text(segments, "## " + text)
     elif t == "heading_3":
-        lines.append("### " + text)
+        _push_text(segments, "### " + text)
     elif t == "bulleted_list_item":
-        lines.append(indent + "- " + text)
+        _push_text(segments, indent + "- " + text)
     elif t == "numbered_list_item":
-        lines.append(indent + "1. " + text)
+        _push_text(segments, indent + "1. " + text)
     elif t == "to_do":
         box = "\u2611" if data.get("checked") else "\u2610"
-        lines.append(indent + f"{box} " + text)
+        _push_text(segments, indent + f"{box} " + text)
     elif t == "toggle":
-        lines.append(indent + "\u25b8 " + text)
+        _push_text(segments, indent + "\u25b8 " + text)
     elif t == "quote":
-        lines.append("> " + text)
+        _push_text(segments, "> " + text)
     elif t == "callout":
         emoji = (data.get("icon") or {}).get("emoji", "\U0001f4a1")
-        lines.append(f"{emoji} " + text)
+        _push_text(segments, f"{emoji} " + text)
     elif t == "code":
         lang = data.get("language", "")
-        lines.append(f"```{lang}\n{text}\n```")
+        _push_text(segments, f"```{lang}\n{text}\n```")
     elif t == "divider":
-        lines.append("\u2500" * 20)
+        _push_text(segments, "\u2500" * 20)
     elif t == "image":
         img = data.get("file") or data.get("external") or {}
+        url = img.get("url", "")
         cap = rich_to_text(data.get("caption"))
-        lines.append(f"[image] {img.get('url', '')}" + (f" \u2014 {cap}" if cap else ""))
+        if url:
+            segments.append({"type": "image", "url": url, "caption": cap})
+        elif cap:
+            _push_text(segments, f"\U0001f4ce {cap}")
     elif t == "table":
         for row in fetch_all_children(block["id"]):
             cells = row.get("table_row", {}).get("cells", [])
-            lines.append(indent + " | ".join(rich_to_text(c) for c in cells))
-        return lines  # rows already consumed; don't recurse below
+            _push_text(segments, indent + " | ".join(rich_to_text(c) for c in cells))
+        return  # rows already consumed; don't recurse below
     else:
         if text:
-            lines.append(indent + text)
+            _push_text(segments, indent + text)
 
     if block.get("has_children") and t != "table":
         for child in fetch_all_children(block["id"]):
-            lines.extend(block_to_lines(child, depth + 1))
-    return lines
+            block_to_segments(child, segments, depth + 1)
 
 
 def prop_value(prop):
@@ -156,7 +172,7 @@ def prop_value(prop):
     return ""
 
 
-def build_gameplan_text(page_id):
+def build_gameplan_segments(page_id):
     page = notion.pages.retrieve(page_id)
     props = page.get("properties", {})
     name = rich_to_text(props.get("Name", {}).get("title")) or "Unknown villain"
@@ -178,15 +194,18 @@ def build_gameplan_text(page_id):
         header += f"updated {updated}\n"
 
     leaks = prop_value(props.get("Top 5 Leaks")).strip()
-    leaks_section = f"\n**Top 5 Leaks**\n{leaks}\n" if leaks else ""
+    if leaks:
+        header += f"\n**Top 5 Leaks**\n{leaks}\n"
 
-    body_lines = []
+    segments = [{"type": "text", "content": header}]
+
+    body_start = len(segments)
     for block in fetch_all_children(page_id):
-        body_lines.extend(block_to_lines(block))
-    body = "\n".join(body_lines).strip()
-    body_section = ("\n" + body) if body else "\n_No gameplan written in the page body yet._"
+        block_to_segments(block, segments)
+    if len(segments) == body_start:
+        _push_text(segments, "\n_No gameplan written in the page body yet._")
 
-    return header + leaks_section + body_section
+    return segments
 
 
 def refresh_index_sync():
@@ -226,6 +245,26 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
+async def download_image(url):
+    """Fetch an image from Notion's (temporary) URL into memory. Returns (bytes, filename) or None."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+                if len(data) > 9_000_000:   # stay under Discord's upload limit
+                    return None
+                # derive a clean filename from the path, ignoring the query string
+                path = url.split("?")[0]
+                fname = path.rsplit("/", 1)[-1] or "image.png"
+                if "." not in fname:
+                    fname += ".png"
+                return data, fname
+    except Exception:
+        return None
+
+
 @tasks.loop(minutes=5)
 async def refresh_index():
     global INDEX
@@ -252,9 +291,9 @@ async def on_ready():
 @tree.command(name="gameplan", description="Get the full gameplan for a villain")
 @app_commands.describe(villain="Start typing the villain's name")
 async def gameplan(interaction: discord.Interaction, villain: str):
-    # ephemeral=True -> only the asker sees it (keeps channels clean).
-    # Change both ephemeral values below to False to post the plan publicly.
-    await interaction.response.defer(ephemeral=True)
+    # Public reply (everyone in the channel sees it) so images can be attached
+    # and the message can auto-delete after DELETE_AFTER_SECONDS.
+    await interaction.response.defer()
 
     entry = INDEX.get(villain.lower())
     if not entry:
@@ -263,20 +302,43 @@ async def gameplan(interaction: discord.Interaction, villain: str):
             entry = matches[0]
         elif len(matches) > 1:
             names = ", ".join(m["name"] for m in matches[:10])
-            await interaction.followup.send(f"Multiple matches: {names}. Be more specific.", ephemeral=True)
+            # errors stay private so they don't clutter the channel
+            await interaction.followup.send(
+                f"Multiple matches: {names}. Be more specific.", ephemeral=True)
             return
     if not entry:
-        await interaction.followup.send(f"No gameplan found for **{villain}**.", ephemeral=True)
+        await interaction.followup.send(
+            f"No gameplan found for **{villain}**.", ephemeral=True)
         return
 
     try:
-        text = await asyncio.to_thread(build_gameplan_text, entry["id"])
+        segments = await asyncio.to_thread(build_gameplan_segments, entry["id"])
     except Exception as e:
         await interaction.followup.send(f"Error fetching gameplan: {e}", ephemeral=True)
         return
 
-    for chunk in chunk_text(text):
-        await interaction.followup.send(chunk, ephemeral=True)
+    for seg in segments:
+        if seg["type"] == "text":
+            for chunk in chunk_text(seg["content"]):
+                if chunk.strip():
+                    await interaction.followup.send(chunk, delete_after=DELETE_AFTER_SECONDS)
+        elif seg["type"] == "image":
+            result = await download_image(seg["url"])
+            caption = seg.get("caption") or ""
+            if result:
+                data, fname = result
+                file = discord.File(io.BytesIO(data), filename=fname)
+                await interaction.followup.send(
+                    content=(f"\U0001f4ce {caption}" if caption else None),
+                    file=file,
+                    delete_after=DELETE_AFTER_SECONDS,
+                )
+            else:
+                # download failed (expired/too big) — note it instead of a broken link
+                await interaction.followup.send(
+                    f"\U0001f4ce [image couldn't load{f' — {caption}' if caption else ''}]",
+                    delete_after=DELETE_AFTER_SECONDS,
+                )
 
 
 @gameplan.autocomplete("villain")
