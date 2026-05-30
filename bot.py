@@ -167,6 +167,7 @@ def build_gameplan_text(page_id):
         prop_value(props.get("Game")),
         prop_value(props.get("Status")),
         prop_value(props.get("Player Profile")),
+        prop_value(props.get("Latest Run")),
     ]))
     updated = page.get("last_edited_time", "")[:10]
 
