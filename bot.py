@@ -1,6 +1,9 @@
 import os
 import asyncio
 
+from dotenv import load_dotenv
+load_dotenv()  # reads a local .env file if present; ignored when deployed
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -12,6 +15,31 @@ DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 GUILD_ID = os.environ.get("GUILD_ID")  # optional: makes the command appear instantly
 
 notion = Client(auth=NOTION_TOKEN)
+
+# notion-client 3.x removed databases.query; querying moved to data_sources.query.
+# This resolves the right call once and caches the data source id for 3.x.
+_DATA_SOURCE_ID = None
+
+
+def _resolve_data_source_id():
+    global _DATA_SOURCE_ID
+    if _DATA_SOURCE_ID:
+        return _DATA_SOURCE_ID
+    db = notion.databases.retrieve(DATABASE_ID)
+    sources = db.get("data_sources") or []
+    if sources:
+        _DATA_SOURCE_ID = sources[0]["id"]
+    else:
+        # fall back to the database id itself if no data_sources array is present
+        _DATA_SOURCE_ID = DATABASE_ID
+    return _DATA_SOURCE_ID
+
+
+def query_database(**kwargs):
+    """Works on notion-client 2.x (databases.query) and 3.x (data_sources.query)."""
+    if hasattr(notion.databases, "query"):
+        return notion.databases.query(database_id=DATABASE_ID, **kwargs)
+    return notion.data_sources.query(data_source_id=_resolve_data_source_id(), **kwargs)
 
 # lowercase name -> {"name": original, "id": page_id}
 INDEX = {}
@@ -163,7 +191,7 @@ def build_gameplan_text(page_id):
 def refresh_index_sync():
     idx, cursor = {}, None
     while True:
-        resp = notion.databases.query(database_id=DATABASE_ID, start_cursor=cursor, page_size=100)
+        resp = query_database(start_cursor=cursor, page_size=100)
         for page in resp["results"]:
             name = rich_to_text(page.get("properties", {}).get("Name", {}).get("title"))
             if name:
