@@ -3,6 +3,7 @@ import io
 import asyncio
 
 import aiohttp
+from PIL import Image
 
 from dotenv import load_dotenv
 load_dotenv()  # reads a local .env file if present; ignored when deployed
@@ -190,7 +191,8 @@ def prop_value(prop):
     return ""
 
 
-def build_gameplan_segments(page_id):
+def build_gameplan(page_id):
+    """Returns (meta, body_segments). meta = name/tag_line/updated/leaks for the embed."""
     page = notion.pages.retrieve(page_id)
     props = page.get("properties", {})
     name = rich_to_text(props.get("Name", {}).get("title")) or "Unknown villain"
@@ -204,27 +206,15 @@ def build_gameplan_segments(page_id):
         prop_value(props.get("Latest Run")),
     ]))
     updated = page.get("last_edited_time", "")[:10]
-
-    header = f"# {name}\n"
-    if tag_line:
-        header += tag_line + "\n"
-    if updated:
-        header += f"updated {updated}\n"
-
     leaks = prop_value(props.get("Top 5 Leaks")).strip()
-    if leaks:
-        header += f"\n**Top 5 Leaks**\n{leaks}\n"
 
-    segments = [{"type": "text", "content": header}]
+    meta = {"name": name, "tag_line": tag_line, "updated": updated, "leaks": leaks}
 
     body_segments = []
     for block in fetch_all_children(page_id):
         block_to_segments(block, body_segments)
-    if not body_segments:
-        body_segments = [{"type": "text", "content": "\n_No gameplan written in the page body yet._"}]
-    segments.extend(body_segments)
 
-    return segments
+    return meta, body_segments
 
 
 def refresh_index_sync():
@@ -267,6 +257,42 @@ tree = app_commands.CommandTree(client)
 
 # Categories for /reads. The category name IS the trigger word a post must start with.
 READ_CATEGORIES = ["value", "bluff", "call", "ai", "timing", "bet size"]
+
+CATEGORY_ICON = {
+    "value": "\U0001f4b0", "bluff": "\U0001f0cf", "call": "\U0001f4de",
+    "ai": "\U0001f3af", "timing": "\u23f1\ufe0f", "bet size": "\U0001f4cf",
+}
+GAMEPLAN_COLOR = 0x2ecc71   # green card for the gameplan
+READS_COLOR = 0x5865F2      # blurple cards for each read category
+
+
+def stitch_images_vertical(images_bytes, max_width=820, gap=10):
+    """Stack multiple screenshots into one tall image (each scaled to a common width)."""
+    imgs = []
+    for b in images_bytes:
+        try:
+            im = Image.open(io.BytesIO(b)).convert("RGB")
+            if im.width > max_width:
+                h = int(im.height * (max_width / im.width))
+                im = im.resize((max_width, h))
+            imgs.append(im)
+        except Exception:
+            pass
+    if not imgs:
+        return None
+    if len(imgs) == 1:
+        out = imgs[0]
+    else:
+        w = max(im.width for im in imgs)
+        total_h = sum(im.height for im in imgs) + gap * (len(imgs) - 1)
+        out = Image.new("RGB", (w, total_h), (15, 18, 24))
+        y = 0
+        for im in imgs:
+            out.paste(im, (0, y))
+            y += im.height + gap
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
 
 # villain name (lower) -> Thread object, refreshed alongside the Notion index
 THREAD_INDEX = {}
@@ -407,49 +433,53 @@ async def gameplan(interaction: discord.Interaction, villain: str):
         return
 
     try:
-        segments = await asyncio.to_thread(build_gameplan_segments, entry["id"])
+        meta, body_segments = await asyncio.to_thread(build_gameplan, entry["id"])
     except Exception as e:
         await interaction.followup.send(f"Error fetching gameplan: {e}", ephemeral=True)
         return
 
-    # Pre-download every image at once (parallel) so the wait happens all together,
-    # not one-after-another. Results are keyed back to their segment by index.
-    image_results = {}
-    image_segs = [(i, s) for i, s in enumerate(segments) if s["type"] == "image"]
-    if image_segs:
-        async with aiohttp.ClientSession() as session:
-            downloads = [download_image(session, s["url"]) for _, s in image_segs]
-            fetched = await asyncio.gather(*downloads)
-        for (i, _), result in zip(image_segs, fetched):
-            image_results[i] = result
-
     sent = []  # collect every message we post so we can delete them later
-    for idx, seg in enumerate(segments):
+
+    # 1) Gameplan card
+    embed = discord.Embed(title=meta["name"], color=GAMEPLAN_COLOR)
+    desc = ""
+    if meta["tag_line"]:
+        desc += meta["tag_line"] + "\n"
+    if meta["updated"]:
+        desc += f"_updated {meta['updated']}_"
+    embed.description = desc.strip() or None
+    if meta["leaks"]:
+        embed.add_field(name="Top 5 Leaks", value=meta["leaks"][:1024], inline=False)
+    sent.append(await interaction.followup.send(embed=embed, wait=True))
+
+    # 2) Gameplan body (text + inline images)
+    if not body_segments:
+        body_segments = [{"type": "text", "content": "_No gameplan written in the page body yet._"}]
+    body_imgs = [(i, s) for i, s in enumerate(body_segments) if s["type"] == "image"]
+    body_dl = {}
+    if body_imgs:
+        async with aiohttp.ClientSession() as session:
+            res = await asyncio.gather(*[download_image(session, s["url"]) for _, s in body_imgs])
+        for (i, _), r in zip(body_imgs, res):
+            body_dl[i] = r
+    for idx, seg in enumerate(body_segments):
         if seg["type"] == "text":
             for chunk in chunk_text(seg["content"]):
                 if chunk.strip():
-                    msg = await interaction.followup.send(chunk, wait=True)
-                    sent.append(msg)
-        elif seg["type"] == "image":
-            result = image_results.get(idx)
-            caption = seg.get("caption") or ""
-            if result:
-                data, fname = result
-                file = discord.File(io.BytesIO(data), filename=fname)
-                msg = await interaction.followup.send(
-                    content=(f"\U0001f4ce {caption}" if caption else None),
-                    file=file,
-                    wait=True,
-                )
+                    sent.append(await interaction.followup.send(chunk, wait=True))
+        else:
+            r = body_dl.get(idx)
+            cap = seg.get("caption") or ""
+            if r:
+                data, fname = r
+                sent.append(await interaction.followup.send(
+                    content=(f"\U0001f4ce {cap}" if cap else None),
+                    file=discord.File(io.BytesIO(data), filename=fname), wait=True))
             else:
-                # download failed (expired/too big) — note it instead of a broken link
-                msg = await interaction.followup.send(
-                    f"\U0001f4ce [image couldn't load{f' — {caption}' if caption else ''}]",
-                    wait=True,
-                )
-            sent.append(msg)
+                sent.append(await interaction.followup.send(
+                    f"\U0001f4ce [image couldn't load{f' \u2014 {cap}' if cap else ''}]", wait=True))
 
-    # --- Append recent reads from the villain's forum thread (found by name) ---
+    # 3) Recent reads from the villain's thread — one stitched card per category
     if not FORUM_CHANNEL_IDS:
         print("reads: FORUM_CHANNEL_IDS not set -> skipping reads")
     thread = THREAD_INDEX.get(entry["name"].strip().lower()) if FORUM_CHANNEL_IDS else None
@@ -465,45 +495,46 @@ async def gameplan(interaction: discord.Interaction, villain: str):
             print("reads collect failed:", e)
 
         if buckets and any(buckets.values()):
-            hdr = await interaction.followup.send(
+            sent.append(await interaction.followup.send(
                 f"\u2500\u2500\u2500\u2500\u2500\n**\U0001f4cb Recent reads** \u2014 newest {READS_PER_CATEGORY} per type",
-                wait=True)
-            sent.append(hdr)
+                wait=True))
 
-            # collect every read image and download them all at once
-            jobs = []  # (category, read_index, image_index, url)
+            # download every read image (parallel), preserving per-category order
+            per_cat_notes = {c: [] for c in READ_CATEGORIES}
+            jobs = []   # (category, url)
             for c in READ_CATEGORIES:
-                for ri, r in enumerate(buckets[c]):
-                    for ii, url in enumerate(r["images"]):
-                        jobs.append((c, ri, ii, url))
-            downloaded = {}
+                for r in buckets[c]:
+                    if r["note"]:
+                        per_cat_notes[c].append(r["note"])
+                    for url in r["images"]:
+                        jobs.append((c, url))
+            dl = []
             if jobs:
                 async with aiohttp.ClientSession() as session:
-                    results = await asyncio.gather(*[download_image(session, j[3]) for j in jobs])
-                for j, res in zip(jobs, results):
-                    downloaded[(j[0], j[1], j[2])] = res
+                    dl = await asyncio.gather(*[download_image(session, j[1]) for j in jobs])
+            per_cat_imgs = {c: [] for c in READ_CATEGORIES}
+            for (c, _), r in zip(jobs, dl):
+                if r:
+                    per_cat_imgs[c].append(r[0])
 
             for c in READ_CATEGORIES:
-                reads = buckets[c]
-                if not reads:
+                if not buckets[c]:
                     continue
-                cmsg = await interaction.followup.send(f"__{c.upper()}__", wait=True)
-                sent.append(cmsg)
-                for ri, r in enumerate(reads):
-                    note = r["note"]
-                    note = note if len(note) <= 200 else note[:197] + "..."
-                    files = []
-                    for ii, _ in enumerate(r["images"]):
-                        res = downloaded.get((c, ri, ii))
-                        if res:
-                            data, fname = res
-                            files.append(discord.File(io.BytesIO(data), filename=fname))
-                    if files:
-                        m = await interaction.followup.send(content=note or None, files=files[:10], wait=True)
-                    else:
-                        # no image (or it failed) — fall back to the note + a jump-link
-                        m = await interaction.followup.send(f"{note} \u2192 {r['jump']}", wait=True)
-                    sent.append(m)
+                notes = per_cat_notes[c]
+                cdesc = "\n".join(f"\u2022 {n[:300]}" for n in notes) if notes else "\u2014"
+                cembed = discord.Embed(title=f"{CATEGORY_ICON[c]} {c.upper()}",
+                                       description=cdesc[:4096], color=READS_COLOR)
+                stitched = None
+                if per_cat_imgs[c]:
+                    stitched = await asyncio.to_thread(stitch_images_vertical, per_cat_imgs[c])
+                if stitched:
+                    fname = c.replace(" ", "_") + ".png"
+                    cembed.set_image(url=f"attachment://{fname}")
+                    m = await interaction.followup.send(
+                        embed=cembed, file=discord.File(io.BytesIO(stitched), filename=fname), wait=True)
+                else:
+                    m = await interaction.followup.send(embed=cembed, wait=True)
+                sent.append(m)
 
     # Schedule all of this reply's messages to delete after DELETE_AFTER_SECONDS.
     if sent:
