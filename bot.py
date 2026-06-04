@@ -241,8 +241,23 @@ def chunk_text(text, limit=1900):
 
 
 intents = discord.Intents.default()
+intents.message_content = True   # required to read trigger words in thread posts
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+
+# Categories for /reads. The category name IS the trigger word a post must start with.
+READ_CATEGORIES = ["value", "bluff", "call", "ai", "timing", "bet size"]
+
+
+def matches_trigger(content, trigger):
+    """True if the post starts with the trigger as a whole word (case-insensitive)."""
+    c = (content or "").strip().lower()
+    t = trigger.lower()
+    if not c.startswith(t):
+        return False
+    rest = c[len(t):]
+    return rest == "" or not rest[0].isalnum()   # next char must be space/colon/punct/end
 
 
 async def download_image(session, url):
@@ -373,6 +388,47 @@ async def villain_autocomplete(interaction: discord.Interaction, current: str):
     cur = current.lower()
     names = sorted(v["name"] for k, v in INDEX.items() if cur in k)
     return [app_commands.Choice(name=n, value=n) for n in names[:25]]
+
+
+@tree.command(name="reads", description="Pull the most recent tagged hands from THIS villain's thread")
+@app_commands.describe(category="Which kind of read to pull")
+@app_commands.choices(category=[app_commands.Choice(name=c, value=c) for c in READ_CATEGORIES])
+async def reads(interaction: discord.Interaction, category: app_commands.Choice[str]):
+    channel = interaction.channel
+    if not isinstance(channel, discord.Thread):
+        await interaction.response.send_message(
+            "Run `/reads` inside a villain's thread.", ephemeral=True)
+        return
+
+    # private to the asker -> no clutter in the thread, nothing to auto-delete
+    await interaction.response.defer(ephemeral=True)
+
+    trig = category.value
+    matched = []
+    try:
+        async for msg in channel.history(limit=500, oldest_first=False):
+            if matches_trigger(msg.content, trig):
+                matched.append(msg)
+                if len(matched) >= 10:
+                    break
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't read this thread: {e}", ephemeral=True)
+        return
+
+    if not matched:
+        await interaction.followup.send(
+            f"No '{trig}' hands found in **{channel.name}** yet.", ephemeral=True)
+        return
+
+    lines = [f"**Last {len(matched)} '{trig}' hands** in {channel.name} (newest first):"]
+    for i, m in enumerate(matched, 1):
+        when = m.created_at.strftime("%b %d")
+        note = (m.content or "").strip().replace("\n", " ")
+        note = note if len(note) <= 140 else note[:137] + "..."
+        lines.append(f"{i}. `{when}` {note} \u2192 {m.jump_url}")
+
+    for chunk in chunk_text("\n".join(lines)):
+        await interaction.followup.send(chunk, ephemeral=True)
 
 
 client.run(DISCORD_TOKEN)
