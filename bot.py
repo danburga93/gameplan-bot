@@ -20,7 +20,21 @@ GUILD_ID = os.environ.get("GUILD_ID")  # optional: makes the command appear inst
 DELETE_AFTER_SECONDS = 16 * 60 * 60   # gameplan replies auto-delete after 16 hours
 
 # Comma-separated forum channel IDs (regs + fish) so /gp can find a villain's thread by name.
-FORUM_CHANNEL_IDS = [int(x) for x in os.environ.get("FORUM_CHANNEL_IDS", "").replace(" ", "").split(",") if x]
+def _load_forum_ids():
+    raw = os.environ.get("FORUM_CHANNEL_IDS")
+    if raw is None:
+        # tolerate a stray space in the variable NAME (e.g. "FORUM_CHANNEL_IDS ")
+        for k, v in os.environ.items():
+            if k.strip() == "FORUM_CHANNEL_IDS":
+                raw = v
+                break
+    raw = (raw or "").replace(" ", "")
+    ids = [int(x) for x in raw.split(",") if x.strip().isdigit()]
+    print(f"FORUM_CHANNEL_IDS raw={os.environ.get('FORUM_CHANNEL_IDS')!r} -> parsed {len(ids)} id(s)")
+    return ids
+
+
+FORUM_CHANNEL_IDS = _load_forum_ids()
 READS_PER_CATEGORY = 2   # how many newest reads per category /gp appends
 
 notion = Client(auth=NOTION_TOKEN)
@@ -288,7 +302,7 @@ async def refresh_threads():
             continue
         threads = list(getattr(ch, "threads", []) or [])
         try:
-            async for t in ch.archived_threads(limit=None):
+            async for t in ch.archived_threads(limit=50):
                 threads.append(t)
         except Exception:
             pass
@@ -353,9 +367,13 @@ async def refresh_index():
 
 @client.event
 async def on_ready():
+    global INDEX
     if not refresh_index.is_running():
-        await refresh_index()          # populate cache before first command
-        refresh_index.start()
+        try:
+            INDEX = await asyncio.to_thread(refresh_index_sync)   # quick, runs in a worker thread
+        except Exception as e:
+            print("Initial index failed:", e)
+        refresh_index.start()   # loop refreshes Notion + builds the thread index in the background
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
         tree.copy_global_to(guild=guild)
