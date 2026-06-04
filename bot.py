@@ -203,11 +203,12 @@ def build_gameplan_segments(page_id):
 
     segments = [{"type": "text", "content": header}]
 
-    body_start = len(segments)
+    body_segments = []
     for block in fetch_all_children(page_id):
-        block_to_segments(block, segments)
-    if len(segments) == body_start:
-        _push_text(segments, "\n_No gameplan written in the page body yet._")
+        block_to_segments(block, body_segments)
+    if not body_segments:
+        body_segments = [{"type": "text", "content": "\n_No gameplan written in the page body yet._"}]
+    segments.extend(body_segments)
 
     return segments
 
@@ -345,6 +346,7 @@ async def refresh_index():
     if FORUM_CHANNEL_IDS:
         try:
             THREAD_INDEX = await refresh_threads()
+            print(f"Threads indexed: {len(THREAD_INDEX)} from {len(FORUM_CHANNEL_IDS)} forum(s)")
         except Exception as e:
             print("Thread refresh failed:", e)
 
@@ -430,10 +432,16 @@ async def gameplan(interaction: discord.Interaction, villain: str):
             sent.append(msg)
 
     # --- Append recent reads from the villain's forum thread (found by name) ---
+    if not FORUM_CHANNEL_IDS:
+        print("reads: FORUM_CHANNEL_IDS not set -> skipping reads")
     thread = THREAD_INDEX.get(entry["name"].strip().lower()) if FORUM_CHANNEL_IDS else None
+    if FORUM_CHANNEL_IDS:
+        print(f"reads: villain '{entry['name']}' thread match = {bool(thread)} "
+              f"(threads indexed: {len(THREAD_INDEX)})")
     if thread:
         try:
             buckets = await collect_recent_reads(thread, READS_PER_CATEGORY)
+            print("reads: counts " + ", ".join(f"{c}={len(buckets[c])}" for c in READ_CATEGORIES))
         except Exception as e:
             buckets = None
             print("reads collect failed:", e)
