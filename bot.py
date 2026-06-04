@@ -19,6 +19,10 @@ GUILD_ID = os.environ.get("GUILD_ID")  # optional: makes the command appear inst
 
 DELETE_AFTER_SECONDS = 16 * 60 * 60   # gameplan replies auto-delete after 16 hours
 
+# Comma-separated forum channel IDs (regs + fish) so /gp can find a villain's thread by name.
+FORUM_CHANNEL_IDS = [int(x) for x in os.environ.get("FORUM_CHANNEL_IDS", "").replace(" ", "").split(",") if x]
+READS_PER_CATEGORY = 2   # how many newest reads per category /gp appends
+
 notion = Client(auth=NOTION_TOKEN)
 
 # notion-client 3.x removed databases.query; querying moved to data_sources.query.
@@ -249,6 +253,9 @@ tree = app_commands.CommandTree(client)
 # Categories for /reads. The category name IS the trigger word a post must start with.
 READ_CATEGORIES = ["value", "bluff", "call", "ai", "timing", "bet size"]
 
+# villain name (lower) -> Thread object, refreshed alongside the Notion index
+THREAD_INDEX = {}
+
 
 def matches_trigger(content, trigger):
     """True if the post starts with the trigger as a whole word (case-insensitive)."""
@@ -258,6 +265,55 @@ def matches_trigger(content, trigger):
         return False
     rest = c[len(t):]
     return rest == "" or not rest[0].isalnum()   # next char must be space/colon/punct/end
+
+
+def _attachment_image_urls(msg):
+    urls = []
+    for a in msg.attachments:
+        ctype = (a.content_type or "")
+        if ctype.startswith("image") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            urls.append(a.url)
+    return urls
+
+
+async def refresh_threads():
+    """Map each villain's forum thread by name (active + archived) across the configured forums."""
+    idx = {}
+    for cid in FORUM_CHANNEL_IDS:
+        try:
+            ch = client.get_channel(cid) or await client.fetch_channel(cid)
+        except Exception as e:
+            print("thread refresh: can't fetch channel", cid, e)
+            continue
+        threads = list(getattr(ch, "threads", []) or [])
+        try:
+            async for t in ch.archived_threads(limit=None):
+                threads.append(t)
+        except Exception:
+            pass
+        for t in threads:
+            idx[t.name.strip().lower()] = t
+    return idx
+
+
+async def collect_recent_reads(thread, per_category):
+    """Newest `per_category` posts per category in a thread. Returns {category: [ {note, images, jump} ]}."""
+    buckets = {c: [] for c in READ_CATEGORIES}
+    remaining = set(READ_CATEGORIES)
+    async for msg in thread.history(limit=800, oldest_first=False):
+        if not remaining:
+            break
+        for c in list(remaining):
+            if matches_trigger(msg.content, c):
+                buckets[c].append({
+                    "note": (msg.content or "").strip(),
+                    "images": _attachment_image_urls(msg),
+                    "jump": msg.jump_url,
+                })
+                if len(buckets[c]) >= per_category:
+                    remaining.discard(c)
+                break   # a post belongs to at most one category
+    return buckets
 
 
 async def download_image(session, url):
@@ -281,11 +337,16 @@ async def download_image(session, url):
 
 @tasks.loop(minutes=5)
 async def refresh_index():
-    global INDEX
+    global INDEX, THREAD_INDEX
     try:
         INDEX = await asyncio.to_thread(refresh_index_sync)
     except Exception as e:
         print("Index refresh failed:", e)
+    if FORUM_CHANNEL_IDS:
+        try:
+            THREAD_INDEX = await refresh_threads()
+        except Exception as e:
+            print("Thread refresh failed:", e)
 
 
 @client.event
@@ -368,16 +429,70 @@ async def gameplan(interaction: discord.Interaction, villain: str):
                 )
             sent.append(msg)
 
+    # --- Append recent reads from the villain's forum thread (found by name) ---
+    thread = THREAD_INDEX.get(entry["name"].strip().lower()) if FORUM_CHANNEL_IDS else None
+    if thread:
+        try:
+            buckets = await collect_recent_reads(thread, READS_PER_CATEGORY)
+        except Exception as e:
+            buckets = None
+            print("reads collect failed:", e)
+
+        if buckets and any(buckets.values()):
+            hdr = await interaction.followup.send(
+                f"\u2500\u2500\u2500\u2500\u2500\n**\U0001f4cb Recent reads** \u2014 newest {READS_PER_CATEGORY} per type",
+                wait=True)
+            sent.append(hdr)
+
+            # collect every read image and download them all at once
+            jobs = []  # (category, read_index, image_index, url)
+            for c in READ_CATEGORIES:
+                for ri, r in enumerate(buckets[c]):
+                    for ii, url in enumerate(r["images"]):
+                        jobs.append((c, ri, ii, url))
+            downloaded = {}
+            if jobs:
+                async with aiohttp.ClientSession() as session:
+                    results = await asyncio.gather(*[download_image(session, j[3]) for j in jobs])
+                for j, res in zip(jobs, results):
+                    downloaded[(j[0], j[1], j[2])] = res
+
+            for c in READ_CATEGORIES:
+                reads = buckets[c]
+                if not reads:
+                    continue
+                cmsg = await interaction.followup.send(f"__{c.upper()}__", wait=True)
+                sent.append(cmsg)
+                for ri, r in enumerate(reads):
+                    note = r["note"]
+                    note = note if len(note) <= 200 else note[:197] + "..."
+                    files = []
+                    for ii, _ in enumerate(r["images"]):
+                        res = downloaded.get((c, ri, ii))
+                        if res:
+                            data, fname = res
+                            files.append(discord.File(io.BytesIO(data), filename=fname))
+                    if files:
+                        m = await interaction.followup.send(content=note or None, files=files[:10], wait=True)
+                    else:
+                        # no image (or it failed) — fall back to the note + a jump-link
+                        m = await interaction.followup.send(f"{note} \u2192 {r['jump']}", wait=True)
+                    sent.append(m)
+
     # Schedule all of this reply's messages to delete after DELETE_AFTER_SECONDS.
     if sent:
-        asyncio.create_task(delete_messages_later(sent, DELETE_AFTER_SECONDS))
+        ids = [m.id for m in sent]
+        asyncio.create_task(delete_messages_later(interaction.channel, ids, DELETE_AFTER_SECONDS))
 
 
-async def delete_messages_later(messages, delay):
-    """Wait, then delete each message. Ignores ones already gone."""
+async def delete_messages_later(channel, message_ids, delay):
+    """Wait, then delete each message via the channel.
+    We re-fetch through the channel (bot token) instead of the interaction webhook,
+    because the interaction token dies after ~15 minutes."""
     await asyncio.sleep(delay)
-    for msg in messages:
+    for mid in message_ids:
         try:
+            msg = await channel.fetch_message(mid)
             await msg.delete()
         except Exception:
             pass
