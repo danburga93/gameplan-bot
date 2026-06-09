@@ -206,7 +206,7 @@ def build_gameplan(page_id):
         prop_value(props.get("Latest Run")),
     ]))
     updated = page.get("last_edited_time", "")[:10]
-    leaks = prop_value(props.get("Top 5 Leaks")).strip()
+    leaks = prop_value(props.get("Top 5 Adjustments")).strip()
 
     meta = {"name": name, "tag_line": tag_line, "updated": updated, "leaks": leaks}
 
@@ -449,7 +449,7 @@ async def gameplan(interaction: discord.Interaction, villain: str):
         desc += f"_updated {meta['updated']}_"
     embed.description = desc.strip() or None
     if meta["leaks"]:
-        embed.add_field(name="Top 5 Leaks", value=meta["leaks"][:1024], inline=False)
+        embed.add_field(name="Top 5 Adjustments", value=meta["leaks"][:1024], inline=False)
     sent.append(await interaction.followup.send(embed=embed, wait=True))
 
     # 2) Gameplan body (text + inline images)
